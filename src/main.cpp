@@ -5,10 +5,18 @@
 
 #include "OneButton.h"
 #include "I2C_LCD.h"
+#include "SoftwareSerial.h"
+#include "DFRobotDFPlayerMini.h"
 
 #define ENCODER_CLK_PIN 4
 #define ENCODER_DT_PIN 5
 #define ENCODER_SW_PIN 3
+
+#define DFPLAYER_RX_PIN 6
+#define DFPLAYER_TX_PIN 7
+
+SoftwareSerial dfPlayerSerial(DFPLAYER_RX_PIN, DFPLAYER_TX_PIN);
+DFRobotDFPlayerMini player;
 
 RTC_DS3231 rtc;
 I2C_LCD lcd(39);
@@ -18,6 +26,7 @@ OneButton encoderButton(ENCODER_SW_PIN, true);
 
 static int lastPos = 0;
 static bool editMode = false;
+static int editPlace = 1; // 0 is hours, 1 is minutes (will swap to 0 when first entering edit mode)
 
 static DateTime alarmTime;
 
@@ -47,12 +56,20 @@ void setup() {
     lcd.display();
     lcd.clear();
     lcd.setCursor(0, 0);
-    lcd.print("Initializing...");
+    lcd.print("Initializing...");      
+
+    delay(5000);
 
     // initializing the rtc
     if(!rtc.begin()) {
       Serial.println("Couldn't find RTC!");
       Serial.flush();
+
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Couldn't find");
+      lcd.setCursor(0, 1);
+      lcd.print("RTC module!");
       while (1) delay(10);
     }
 
@@ -75,12 +92,33 @@ void setup() {
     rtc.disableAlarm(2);
 
     // schedule an alarm 5 minutes in the future as a default starting point
-    alarmTime = rtc.now() + TimeSpan(5 * 60) - TimeSpan(rtc.now().second());
+    alarmTime = rtc.now() + TimeSpan(0, 0, 5, 0) - TimeSpan(rtc.now().second());
     if(!rtc.setAlarm1(
-            alarmTime,
-            DS3231_A1_Hour // this mode triggers the alarm when the minutes match
+      alarmTime,
+      DS3231_A1_Hour // this mode triggers the alarm when the minutes match
     )) {
-        Serial.println("Error, default alarm wasn't set!");
+      Serial.println("Error, default alarm wasn't set!");
+
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Couldn't set");
+      lcd.setCursor(0, 1);
+      lcd.print("default alarm!");
+      while (1) delay(10);
+    }
+
+    //initialize dfplayer
+    dfPlayerSerial.begin(9600);
+    if (player.begin(dfPlayerSerial)) {
+      player.volume(25);
+    } else {
+      Serial.println("Connecting to DFPlayer Mini failed!");
+
+      lcd.setCursor(0, 0);
+      lcd.print("Couldn't start");
+      lcd.setCursor(0, 1);
+      lcd.print("DFPlayer mini!");
+      while (1) delay(10);
     }
 
     runner.init();
@@ -89,12 +127,25 @@ void setup() {
     runner.addTask(updateDisplayTask);
     runner.addTask(turnOffBacklightTask);
 
-    delay(5000);
+    delay(1000);
     updateDisplayTask.enable();
     restartBacklightTimer();
 }
 
 void loop() {
+  // check if a new time is being set
+  if (Serial.available()) {
+    char iso8601[20];
+    Serial.readBytes(iso8601, 20);
+
+    DateTime dt = DateTime(iso8601);
+
+    Serial.print("Adjusted Time To: ");
+    Serial.println(dt.timestamp());
+
+    rtc.adjust(dt);
+  }
+
   // check if alarm is going off
   if (rtc.alarmFired(1)) {
     onAlarm();
@@ -124,12 +175,12 @@ void updateDisplay() {
 }
 
 void displayAlarmTime() {
-  char time[10] = "hh:mm:ss";
+  char time[10] = "hh:mm";
   alarmTime.toString(time);
   lcd.clear();
   lcd.setCursor(3,0);
   lcd.print("Alarm Time:");
-  lcd.setCursor(4,1);
+  lcd.setCursor(5,1);
   lcd.print(time);
 }
 
@@ -144,49 +195,60 @@ void turnOffBacklight() {
 
 void handleEncoder() {
   encoder.tick();
-  int newPos = encoder.getPosition();
+  int currentPos = encoder.getPosition();
 
-  if (lastPos != newPos) {
-    alarmTime = rtc.getAlarm1() + TimeSpan(newPos * 60);
+  if (lastPos != currentPos) {
+    if (editPlace == 0) {
+      alarmTime = rtc.getAlarm1() + TimeSpan(0, currentPos, 0, 0);
+    } else {
+      alarmTime = rtc.getAlarm1() + TimeSpan(0, 0, currentPos, 0);
+    }    
 
     restartBacklightTimer();
     displayAlarmTime();
   }
 
-  lastPos = newPos;
+  lastPos = currentPos;
 }
 
 void onEncoderClick() {
   restartBacklightTimer();
 
-  editMode = !editMode;
+  // update alarm time on rtc module
+  rtc.setAlarm1(
+    alarmTime,
+    DS3231_A1_Hour
+  );
 
-  if (editMode) {
+  if (editPlace == 1 || editMode == false) {
+    editMode = !editMode;
+  } 
+
+  if (editMode) { // if entering edit mode
+    if (editPlace == 0) {
+      editPlace = 1;
+    } else {
+      editPlace = 0;
+    }
+    encoder.setPosition(0);
+    lastPos = 0;
+
     updateDisplayTask.disable();
-
     displayAlarmTime();
-  } else {
+  } else { // if leaving edit mode
     updateDisplayTask.enable();
-
-    // update alarm time on rtc module
-    rtc.setAlarm1(
-      rtc.getAlarm1() + TimeSpan(lastPos * 60),
-      DS3231_A1_Hour
-    );
 
     char time[10] = "hh:mm:ss";
     Serial.print("New Alarm Time: ");
     rtc.getAlarm1().toString(time);
     Serial.println(time);
-
-    // reset encoder position
-    lastPos = 0;
   }
 }
 
 void onAlarm() {
   Serial.println("Alarm fired!");
 
+  turnOffBacklightTask.cancel();
   lcd.setBacklight(true);
   lcd.clear();
   lcd.setCursor(0,0);
@@ -194,5 +256,7 @@ void onAlarm() {
   lcd.setCursor(4,1);
   lcd.print("Wake up!");
 
-  // TODO put mp3 code here
+  player.randomAll(); //Random play all the mp3.
+  delay(500);
+  player.next();
 }
